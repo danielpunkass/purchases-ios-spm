@@ -265,8 +265,8 @@ extension CustomerInfoResponse.Subscriber {
         let subscriptions = self.subscriptions
         let latestNonSubscriptionTransactionsByProductId = self.nonSubscriptions
 			// Perhaps all non-subscription purchases should be represented in the "all purchases" result,
-			// but if we're going to default to just one, favor one that is not sandbox.
-			.compactMapValues { $0.filter { $0.isSandbox == false }.last ?? $0.last }
+			// but if we're going to default to just one, favor one that matches the current sandbox state.
+			.compactMapValues { $0.filter { $0.isSandbox == BundleSandboxEnvironmentDetector.default.isSandbox }.last ?? $0.last }
             .mapValues { $0.asSubscription }
 
         return subscriptions + latestNonSubscriptionTransactionsByProductId
