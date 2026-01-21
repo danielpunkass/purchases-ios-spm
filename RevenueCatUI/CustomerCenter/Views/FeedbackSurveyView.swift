@@ -13,7 +13,7 @@
 //  Created by Cesar de la Vega on 12/6/24.
 //
 
-import RevenueCat
+@_spi(Internal) import RevenueCat
 import SwiftUI
 
 #if os(iOS)
@@ -80,6 +80,12 @@ struct FeedbackSurveyView: View {
             List {
                 content
             }
+            .dismissCircleButtonToolbarIfNeeded(
+                navigationOptions: navigationOptions,
+                customDismiss: {
+                    isPresented = false
+                }
+            )
             .compatibleNavigation(
                 item: $viewModel.promotionalOfferData,
                 usesNavigationStack: navigationOptions.usesNavigationStack
@@ -152,11 +158,7 @@ struct FeedbackSurveyButtonsView: View {
             }
             .disabled(self.loadingOption != nil)
         }
-        .applyIf(tintColor != nil, apply: { $0.tint(tintColor) })
-    }
-
-    private var tintColor: Color? {
-        Color.from(colorInformation: appearance.accentColor, for: self.colorScheme)
+        .applyIfLet(appearance.tintColor(colorScheme: colorScheme), apply: { $0.tint($1)})
     }
 }
 
