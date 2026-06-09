@@ -24,11 +24,13 @@ class Backend {
     let customerCenterConfig: CustomerCenterConfigAPI
     let redeemWebPurchaseAPI: RedeemWebPurchaseAPI
     let virtualCurrenciesAPI: VirtualCurrenciesAPI
+    let workflowsAPI: WorkflowsAPI
+    let adsAPI: AdsAPI
+    let remoteConfigAPI: RemoteConfigAPI
 
     private let config: BackendConfiguration
 
     convenience init(
-        apiKey: String,
         systemInfo: SystemInfo,
         httpClientTimeout: TimeInterval = Configuration.networkTimeoutDefault,
         eTagManager: ETagManager,
@@ -38,10 +40,9 @@ class Backend {
         diagnosticsTracker: DiagnosticsTrackerType?,
         dateProvider: DateProvider = DateProvider()
     ) {
-        let httpClient = HTTPClient(apiKey: apiKey,
-                                    systemInfo: systemInfo,
+        let httpClient = HTTPClient(systemInfo: systemInfo,
                                     eTagManager: eTagManager,
-                                    signing: Signing(apiKey: apiKey, clock: systemInfo.clock),
+                                    signing: Signing(apiKey: systemInfo.apiKey, clock: systemInfo.clock),
                                     diagnosticsTracker: diagnosticsTracker,
                                     requestTimeout: httpClientTimeout,
                                     operationDispatcher: OperationDispatcher.default)
@@ -49,6 +50,7 @@ class Backend {
                                           operationDispatcher: operationDispatcher,
                                           operationQueue: QueueProvider.createBackendQueue(),
                                           diagnosticsQueue: QueueProvider.createDiagnosticsQueue(),
+                                          workflowsQueue: QueueProvider.createWorkflowsQueue(),
                                           systemInfo: systemInfo,
                                           offlineCustomerInfoCreator: offlineCustomerInfoCreator,
                                           dateProvider: dateProvider)
@@ -65,6 +67,9 @@ class Backend {
         let customerCenterConfig = CustomerCenterConfigAPI(backendConfig: backendConfig)
         let redeemWebPurchaseAPI = RedeemWebPurchaseAPI(backendConfig: backendConfig)
         let virtualCurrenciesAPI = VirtualCurrenciesAPI(backendConfig: backendConfig)
+        let workflowsAPI = WorkflowsAPI(backendConfig: backendConfig)
+        let adsAPI = AdsAPI(backendConfig: backendConfig)
+        let remoteConfigAPI = RemoteConfigAPI(backendConfig: backendConfig)
 
         self.init(backendConfig: backendConfig,
                   customerAPI: customer,
@@ -75,7 +80,10 @@ class Backend {
                   internalAPI: internalAPI,
                   customerCenterConfig: customerCenterConfig,
                   redeemWebPurchaseAPI: redeemWebPurchaseAPI,
-                  virtualCurrenciesAPI: virtualCurrenciesAPI)
+                  virtualCurrenciesAPI: virtualCurrenciesAPI,
+                  workflowsAPI: workflowsAPI,
+                  adsAPI: adsAPI,
+                  remoteConfigAPI: remoteConfigAPI)
     }
 
     required init(backendConfig: BackendConfiguration,
@@ -87,7 +95,10 @@ class Backend {
                   internalAPI: InternalAPI,
                   customerCenterConfig: CustomerCenterConfigAPI,
                   redeemWebPurchaseAPI: RedeemWebPurchaseAPI,
-                  virtualCurrenciesAPI: VirtualCurrenciesAPI) {
+                  virtualCurrenciesAPI: VirtualCurrenciesAPI,
+                  workflowsAPI: WorkflowsAPI,
+                  adsAPI: AdsAPI,
+                  remoteConfigAPI: RemoteConfigAPI) {
         self.config = backendConfig
 
         self.customer = customerAPI
@@ -99,6 +110,9 @@ class Backend {
         self.customerCenterConfig = customerCenterConfig
         self.redeemWebPurchaseAPI = redeemWebPurchaseAPI
         self.virtualCurrenciesAPI = virtualCurrenciesAPI
+        self.workflowsAPI = workflowsAPI
+        self.adsAPI = adsAPI
+        self.remoteConfigAPI = remoteConfigAPI
     }
 
     func clearHTTPClientCaches() {
@@ -123,6 +137,18 @@ class Backend {
                            completion: completion)
     }
 
+    func isPurchaseAllowedByRestoreBehavior(
+        appUserID: String,
+        transactionJWS: String,
+        isAppBackgrounded: Bool,
+        completion: @escaping CustomerAPI.IsPurchaseAllowedByRestoreBehaviorResponseHandler
+    ) {
+        self.customer.isPurchaseAllowedByRestoreBehavior(appUserID: appUserID,
+                                                         transactionJWS: transactionJWS,
+                                                         isAppBackgrounded: isAppBackgrounded,
+                                                         completion: completion)
+    }
+
     func getCustomerInfo(appUserID: String,
                          isAppBackgrounded: Bool,
                          allowComputingOffline: Bool = true,
@@ -133,17 +159,31 @@ class Backend {
                                       completion: completion)
     }
 
+    // swiftlint:disable:next function_parameter_count
     func post(receipt: EncodedAppleReceipt,
               productData: ProductRequestData?,
               transactionData: PurchasedTransactionData,
+              postReceiptSource: PostReceiptSource,
               observerMode: Bool,
+              // Value at the time of the purchase (which might come from the `LocalTransactionMetadataStore`)
+              originalPurchaseCompletedBy: PurchasesAreCompletedBy?,
               appTransaction: String? = nil,
+              associatedTransactionId: String? = nil,
+              sdkOriginated: Bool = false,
+              appUserID: String,
+              containsAttributionData: Bool = false,
               completion: @escaping CustomerAPI.CustomerInfoResponseHandler) {
         self.customer.post(receipt: receipt,
                            productData: productData,
                            transactionData: transactionData,
+                           postReceiptSource: postReceiptSource,
                            observerMode: observerMode,
+                           originalPurchaseCompletedBy: originalPurchaseCompletedBy,
                            appTransaction: appTransaction,
+                           associatedTransactionId: associatedTransactionId,
+                           sdkOriginated: sdkOriginated,
+                           appUserID: appUserID,
+                           containsAttributionData: containsAttributionData,
                            completion: completion)
     }
 
@@ -214,6 +254,8 @@ extension Backend {
 
     enum QueueProvider {
 
+        private static let maxConcurrentWorkflowOperations = 4
+
         static func createBackendQueue() -> OperationQueue {
             let operationQueue = OperationQueue()
             operationQueue.name = "RC Backend Queue"
@@ -226,6 +268,18 @@ extension Backend {
             operationQueue.name = "RC Diagnostics Queue"
             operationQueue.maxConcurrentOperationCount = 1
             operationQueue.qualityOfService = .background
+            return operationQueue
+        }
+
+        static func createWorkflowsQueue() -> OperationQueue {
+            let operationQueue = OperationQueue()
+            operationQueue.name = "RC Workflows Queue"
+            // Workflow prefetches run here so their CDN asset downloads overlap instead of serializing
+            // on the single backend queue. Capped at 4; each GetWorkflowOperation holds its slot
+            // through the CDN download, so this bounds concurrent CDN downloads at 4 too.
+            // Intentionally no `.background` QoS (unlike the diagnostics queue): these prefetches gate
+            // offerings delivery, so they keep the default QoS like the main backend queue.
+            operationQueue.maxConcurrentOperationCount = Self.maxConcurrentWorkflowOperations
             return operationQueue
         }
 

@@ -5,13 +5,16 @@
 //  Created by Nacho Soto on 7/27/23.
 //
 
-import RevenueCat
+@_spi(Internal) import RevenueCat
 #if DEBUG
 @testable import RevenueCatUI
 #else
 import RevenueCatUI
 #endif
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
 
 struct APIKeyDashboardList: View {
 
@@ -43,9 +46,30 @@ struct APIKeyDashboardList: View {
 
     @State
     private var presentPaywallOffering: Offering?
-    
+
+    @State
+    private var presentWorkflowSheetOffering: Offering?
+
+    @State
+    private var presentWorkflowFullOffering: Offering?
+
+    @State
+    private var workflowExitOfferOffering: Offering?
+
+    @State
+    private var presentedWorkflowExitOffer: Offering?
+
     @State
     private var isLoadingPaywall: Bool = false
+
+    @State
+    private var customVariables: [String: CustomVariableValue] = [:]
+
+    @State
+    private var isShowingVariablesEditor = false
+
+    @State
+    private var searchText = Constants.sandboxPaywallSearch
 
     var body: some View {
         ZStack {
@@ -57,17 +81,28 @@ struct APIKeyDashboardList: View {
                     #endif
                     .toolbar {
                         ToolbarItem(placement: .automatic) {
-                            Button {
-                                Task {
-                                    await fetchOfferings()
+                            HStack(spacing: 16) {
+                                Button {
+                                    isShowingVariablesEditor = true
+                                } label: {
+                                    Image(systemName: "curlybraces")
                                 }
-                            } label: {
-                                Image(systemName: "arrow.clockwise")
+
+                                Button {
+                                    Task {
+                                        await fetchOfferings()
+                                    }
+                                } label: {
+                                    Image(systemName: "arrow.clockwise")
+                                }
+                                #if !os(watchOS)
+                                .keyboardShortcut("r", modifiers: .shift)
+                                #endif
                             }
-                            #if !os(watchOS)
-                            .keyboardShortcut("r", modifiers: .shift)
-                            #endif
                         }
+                    }
+                    .sheet(isPresented: $isShowingVariablesEditor) {
+                        CustomVariablesEditorView(variables: $customVariables)
                     }
             }
             .task {
@@ -95,7 +130,7 @@ struct APIKeyDashboardList: View {
             let offerings = try await Purchases.shared.offerings()
                 .all
                 .map(\.value)
-                .sorted { $0.serverDescription > $1.serverDescription }
+                .sorted { $0.id < $1.id }
 
             if let presentedPaywall = presentedPaywall {
                 for offering in offerings {
@@ -121,7 +156,13 @@ struct APIKeyDashboardList: View {
 
             self.offerings = .success(
                 .init(
-                    sections: Array(offeringsBySection.keys).sorted { $0.description < $1.description },
+                    sections: Array(offeringsBySection.keys).sorted {
+                        switch ($0.name, $1.name) {
+                        case (nil, _): return false
+                        case (_, nil): return true
+                        default: return $0.description < $1.description
+                        }
+                    },
                     offeringsBySection: offeringsBySection
                 )
             )
@@ -152,57 +193,84 @@ struct APIKeyDashboardList: View {
         }
     }
 
-    private func offeringHasComponents(_ offering: Offering) -> Bool {
-        offering.paywallComponents != nil
+    private func filteredOfferings(for template: Template, in data: Data) -> [Offering] {
+        let offerings = data.offeringsBySection[template] ?? []
+        guard !searchText.isEmpty else { return offerings }
+        return offerings.filter {
+            $0.id.localizedCaseInsensitiveContains(searchText) ||
+            $0.serverDescription.localizedCaseInsensitiveContains(searchText)
+        }
     }
+
 
     @ViewBuilder
     private func list(with data: Data) -> some View {
         List {
             ForEach(data.sections, id: \.self) { template in
-                Section {
-                    ForEach(data.offeringsBySection[template]!, id: \.id) { offering in
-                        if offering.paywall != nil || offeringHasComponents(offering) {
-                            #if targetEnvironment(macCatalyst)
-                            NavigationLink(
-                                destination: PaywallPresenter(offering: offering,
-                                                              mode: .default,
-                                                              introEligility: .eligible,
-                                                              displayCloseButton: false),
-                                tag: PresentedPaywall(offering: offering, mode: .default),
-                                selection: self.$presentedPaywall
-                            ) {
-                                OfferButton(offering: offering) {}
-                                .contextMenu {
-                                    self.contextMenu(for: offering)
+                let offerings = filteredOfferings(for: template, in: data)
+                if !offerings.isEmpty {
+                    Section {
+                        ForEach(offerings, id: \.id) { offering in
+                            if offering.hasPaywall {
+                                #if targetEnvironment(macCatalyst)
+                                NavigationLink(
+                                    destination: PaywallPresenter(offering: offering,
+                                                                  mode: .default,
+                                                                  introEligility: .eligible,
+                                                                  displayCloseButton: false)
+                                        .customPaywallVariables(self.customVariables),
+                                    tag: PresentedPaywall(offering: offering, mode: .default),
+                                    selection: self.$presentedPaywall
+                                ) {
+                                    OfferButton(offering: offering) {}
+                                    .contextMenu {
+                                        self.contextMenu(for: offering)
+                                    }
                                 }
-                            }
-                            #else
-                            OfferButton(offering: offering) {
-                                self.isLoadingPaywall = true
-                                self.presentedPaywall = .init(offering: offering, mode: .default)
-                            }
+                                #else
+                                OfferButton(offering: offering) {
+                                    self.isLoadingPaywall = true
+                                    self.presentPaywallOffering = offering
+                                }
+                                    #if !os(watchOS)
+                                    .contextMenu {
+                                        self.contextMenu(for: offering)
+                                    }
+                                    #endif
+                                #endif
+                            } else {
                                 #if !os(watchOS)
+                                OfferButton(offering: offering) {
+                                    self.isLoadingPaywall = true
+                                    self.presentedPaywall = .init(offering: offering, mode: .workflow)
+                                }
                                 .contextMenu {
-                                    self.contextMenu(for: offering)
+                                    self.button(for: .workflow, offering: offering)
+                                    self.button(for: .presentWorkflow, offering: offering)
+                                }
+                                #else
+                                VStack(alignment: .leading) {
+                                    Text(offering.id)
+                                    Text(offering.serverDescription)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
                                 }
                                 #endif
-                            #endif
+                            }
                         }
-                        else {
-                            Text(offering.serverDescription)
-                        }
+                    } header: {
+                        Text(verbatim: template.description)
                     }
-                } header: {
-                    Text(verbatim: template.description)
                 }
             }
         }
+        .searchable(text: $searchText, prompt: "Search offerings")
         .sheet(item: self.$presentedPaywall) { paywall in
             PaywallPresenter(offering: paywall.offering, mode: paywall.mode, introEligility: .eligible)
                 .onRestoreCompleted { _ in
                     self.presentedPaywall = nil
                 }
+                .customPaywallVariables(self.customVariables)
                 .onAppear {
                     self.isLoadingPaywall = false
                     if let errorInfo = paywall.offering.paywallComponents?.data.errorInfo {
@@ -216,6 +284,7 @@ struct APIKeyDashboardList: View {
                 .onRestoreCompleted { _ in
                     self.presentedPaywall = nil
                 }
+                .customPaywallVariables(self.customVariables)
                 .onAppear {
                     self.isLoadingPaywall = false
                     if let errorInfo = paywall.offering.paywallComponents?.data.errorInfo {
@@ -226,6 +295,39 @@ struct APIKeyDashboardList: View {
         #endif
                 .presentPaywallIfNeededModifier(offering: $offeringToPresent)
                 .presentPaywall(offering: $presentPaywallOffering, onDismiss: { })
+                // Uses offeringIdentifier content so workflow context resolves correctly.
+                // Exit offer is wired manually because presentPaywall doesn't support workflows yet.
+                .sheet(item: self.$presentWorkflowSheetOffering, onDismiss: self.handleWorkflowDismiss) { offering in
+                    self.workflowPaywallView(for: offering)
+                }
+                .fullScreenCover(item: self.$presentWorkflowFullOffering, onDismiss: self.handleWorkflowDismiss) { offering in
+                    self.workflowPaywallView(for: offering)
+                }
+                .sheet(item: self.$presentedWorkflowExitOffer) { exitOffering in
+                    PaywallView(offering: exitOffering)
+                        .customPaywallVariables(self.customVariables)
+                }
+                .customPaywallVariables(self.customVariables)
+                .onChange(of: offeringToPresent) { offering in
+                    if offering != nil {
+                        self.isLoadingPaywall = false
+                    }
+                }
+                .onChange(of: presentPaywallOffering) { offering in
+                    if offering != nil {
+                        self.isLoadingPaywall = false
+                    }
+                }
+                .onChange(of: presentWorkflowSheetOffering) { offering in
+                    if offering != nil {
+                        self.isLoadingPaywall = false
+                    }
+                }
+                .onChange(of: presentWorkflowFullOffering) { offering in
+                    if offering != nil {
+                        self.isLoadingPaywall = false
+                    }
+                }
     }
 
     #if !os(watchOS)
@@ -234,8 +336,61 @@ struct APIKeyDashboardList: View {
         ForEach(PaywallTesterViewMode.allCases, id: \.self) { mode in
             self.button(for: mode, offering: offering)
         }
+
+        #if os(iOS)
+        // Presents through the UIKit `PaywallViewController` so its dismissal handling and the
+        // workflow exit-offer bridge can be exercised.
+        Button {
+            self.isLoadingPaywall = true
+            self.presentUIKitPaywall(for: offering)
+        } label: {
+            Text("UIKit View Controller")
+            Image(systemName: "rectangle.portrait.on.rectangle.portrait")
+        }
+        #endif
     }
     #endif
+
+    #if os(iOS)
+    @MainActor
+    private func presentUIKitPaywall(for offering: Offering) {
+        let windows = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap(\.windows)
+        guard var top = (windows.first(where: \.isKeyWindow) ?? windows.first)?.rootViewController else {
+            self.isLoadingPaywall = false
+            return
+        }
+        while let presented = top.presentedViewController {
+            top = presented
+        }
+        top.present(PaywallViewController(offering: offering, displayCloseButton: true), animated: true)
+        self.isLoadingPaywall = false
+    }
+    #endif
+
+    @ViewBuilder
+    private func workflowPaywallView(for offering: Offering) -> some View {
+        PaywallView(configuration: .init(
+            content: .offeringIdentifier(offering.identifier, presentedOfferingContext: nil),
+            displayCloseButton: true,
+            purchaseHandler: .default()
+        ))
+        #if DEBUG
+        .environment(\.workflowExitOfferOfferingBinding, self.$workflowExitOfferOffering)
+        #endif
+        .customPaywallVariables(self.customVariables)
+        .onAppear {
+            self.isLoadingPaywall = false
+        }
+    }
+
+    private func handleWorkflowDismiss() {
+        if let exitOffer = self.workflowExitOfferOffering {
+            self.presentedWorkflowExitOffer = exitOffer
+            self.workflowExitOfferOffering = nil
+        }
+    }
 
     @ViewBuilder
     private func button(for selectedMode: PaywallTesterViewMode, offering: Offering) -> some View {
@@ -244,12 +399,20 @@ struct APIKeyDashboardList: View {
             switch selectedMode {
             case .fullScreen:
                 self.presentedPaywallCover = .init(offering: offering, mode: selectedMode)
-            case .sheet, .footer, .condensedFooter:
+            case .sheet:
                 self.presentedPaywall = .init(offering: offering, mode: selectedMode)
+            #if !os(watchOS) && !os(macOS)
+            case .footer, .condensedFooter:
+                self.presentedPaywall = .init(offering: offering, mode: selectedMode)
+            #endif
             case .presentIfNeeded:
                 self.offeringToPresent = offering
             case .presentPaywall:
                 self.presentPaywallOffering = offering
+            case .workflow:
+                self.presentWorkflowSheetOffering = offering
+            case .presentWorkflow:
+                self.presentWorkflowFullOffering = offering
             }
         } label: {
             Text(selectedMode.name)
@@ -264,7 +427,12 @@ struct APIKeyDashboardList: View {
         var body: some View {
             Button(action: action) {
                 HStack {
-                    Text(self.offering.serverDescription)
+                    VStack(alignment: .leading) {
+                        Text(self.offering.id)
+                        Text(self.offering.serverDescription)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                     Spacer()
                     if let errorInfo = self.offering.paywallComponents?.data.errorInfo, !errorInfo.isEmpty {
                         Image(systemName: "exclamationmark.circle.fill")

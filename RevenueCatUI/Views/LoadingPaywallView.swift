@@ -91,7 +91,8 @@ private extension LoadingPaywallView {
             uniqueKeysWithValues: packages.map { ($0, .unknown) }
         )
     })
-    static let purchaseHandler: PurchaseHandler = .init(purchases: LoadingPaywallPurchases())
+    static let purchases = LoadingPaywallPurchases()
+    static let purchaseHandler: PurchaseHandler = .init(purchases: purchases, eventTracker: .init(purchases: purchases))
 
     static let offeringIdentifier = "offering"
     static let weeklyPackage = Package(
@@ -169,15 +170,29 @@ private final class LoadingPaywallPurchases: PaywallPurchasesType {
         SubscriptionHistoryTracker()
     }
 
+    func offerings() async throws -> Offerings { throw ErrorCode.configurationError }
+
+    var cachedOfferings: Offerings? { nil }
+
+#if !os(tvOS)
+    func workflow(forOfferingIdentifier offeringID: String) async throws -> WorkflowDataResult {
+        throw ErrorCode.configurationError
+    }
+
+    func cachedWorkflow(forOfferingIdentifier offeringID: String) -> WorkflowDataResult? {
+        return nil
+    }
+#endif
+
     func customerInfo() async throws -> RevenueCat.CustomerInfo {
         fatalError("Should not be able to purchase")
     }
 
-    func purchase(package: Package) async throws -> PurchaseResultData {
-        fatalError("Should not be able to purchase")
-    }
-
-    func purchase(package: Package, promotionalOffer: PromotionalOffer) async throws -> PurchaseResultData {
+    func purchase(
+        package: Package,
+        promotionalOffer: PromotionalOffer?,
+        paywallEvent: PaywallEvent?
+    ) async throws -> PurchaseResultData {
         fatalError("Should not be able to purchase")
     }
 
@@ -187,6 +202,16 @@ private final class LoadingPaywallPurchases: PaywallPurchasesType {
 
     func track(paywallEvent: PaywallEvent) async {
         // Ignoring events from loading paywall view
+    }
+
+    func cachePurchaseData(presentedOfferingContext: PresentedOfferingContext,
+                           paywallEvent: PaywallEvent?,
+                           productIdentifier: String) {
+        // No-op for loading paywall
+    }
+
+    func clearCachedPurchaseData(productIdentifier: String) {
+        // No-op for loading paywall
     }
 
     func invalidateCustomerInfoCache() {

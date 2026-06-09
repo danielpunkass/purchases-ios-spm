@@ -12,7 +12,7 @@
 //  Created by Antonio Pallares on 13/2/25.
 
 import Nimble
-@testable import RevenueCat
+@_spi(Internal) @testable import RevenueCat
 import XCTest
 
 class PaywallComponentsDecodingTests: BaseHTTPResponseTest {
@@ -34,6 +34,7 @@ class PaywallComponentsDecodingTests: BaseHTTPResponseTest {
         expect(offering.packages).to(haveCount(1))
 
         let components = try XCTUnwrap(offering.paywallComponents)
+        expect(components.id) == "pw_test_1"
         expect(components.templateName) == "componentsTEST"
         expect(components.revision) == 3
         expect(components.componentsConfig.base.background) == .color(.init(light: .hex("#220000ff"), dark: nil))

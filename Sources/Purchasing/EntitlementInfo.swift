@@ -14,6 +14,8 @@
 
 import Foundation
 
+// swiftlint:disable file_length
+
 /**
  Enum of supported stores
  */
@@ -51,6 +53,9 @@ import Foundation
 
     /// For entitlements granted via the Test Store.
     @objc(RCTestStore) case testStore = 10
+
+    /// For entitlements granted via the Galaxy Store.
+    @objc(RCGalaxy) case galaxy = 11
 
 }
 
@@ -149,7 +154,8 @@ extension PeriodType: DefaultValueProvider {
     @objc public var productIdentifier: String { self.contents.productIdentifier }
 
     /**
-     The product plan identifier that unlocked this entitlement (for a Google Play subscription purchase)
+     The product plan identifier that unlocked this entitlement (for Google Play subscription purchases
+     and Apple purchases with non-upFront billing plans)
      */
     @objc public var productPlanIdentifier: String? { self.contents.productPlanIdentifier }
 

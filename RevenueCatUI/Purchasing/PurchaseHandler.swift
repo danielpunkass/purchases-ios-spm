@@ -8,10 +8,11 @@
 //      https://opensource.org/licenses/MIT
 //
 //  PurchaseHandler.swift
-//  
+//
 //  Created by Nacho Soto on 7/13/23.
 
 import Combine
+import Foundation
 @_spi(Internal) import RevenueCat
 import StoreKit
 import SwiftUI
@@ -33,6 +34,10 @@ final class PurchaseHandler: ObservableObject {
     private var cancellables: Set<AnyCancellable> = Set()
 
     private let purchases: PaywallPurchasesType
+    private let paywallEventTracker: PaywallEventTracker
+
+    /// Side-by-side paywalls should use separate `PurchaseHandler` instances so each keeps its own session.
+    private var activePaywallSessionID: PaywallEvent.SessionID?
 
     /// Where responsibility for completing purchases lies
     var purchasesAreCompletedBy: PurchasesAreCompletedBy {
@@ -56,11 +61,11 @@ final class PurchaseHandler: ObservableObject {
 
     /// Whether a purchase is currently in progress
     @Published
-    fileprivate(set) var packageBeingPurchased: Package?
+    var packageBeingPurchased: Package?
 
     /// Whether a purchase or restore is currently in progress
     @Published
-    fileprivate(set) var actionTypeInProgress: ActionType?
+    var actionTypeInProgress: ActionType?
 
     /// Whether a purchase or restore is currently in progress
     var actionInProgress: Bool {
@@ -73,7 +78,27 @@ final class PurchaseHandler: ObservableObject {
     /// More extensible than a boolean - gives access to full result data for
     /// potential future exit offer triggers (e.g., based on specific products).
     @Published
-    fileprivate(set) var sessionPurchaseResult: PurchaseResultData?
+    fileprivate(set) var sessionPurchaseResult: PurchaseResultData? {
+        willSet {
+            if haveBothBeenCanceled(lhs: newValue, rhs: sessionPurchaseResult) {
+                self.consecutiveCancellationRequestID = UUID()
+            }
+        }
+    }
+
+    private func haveBothBeenCanceled(lhs: PurchaseResultData?, rhs: PurchaseResultData?) -> Bool {
+        switch (lhs, rhs) {
+        case (nil, nil):
+            return false
+        case let (left, right):
+            return left?.userCancelled == true && right?.userCancelled == true
+        }
+    }
+
+    /// Unique identifier for the latest `consecutiveCancellationRequestID`.
+    /// This allows SwiftUI preference listeners to receive consecutive identical results.
+    @Published
+    fileprivate(set) var consecutiveCancellationRequestID: UUID?
 
     /// Whether a purchase was successfully completed in the current session.
     /// Convenience property for checking if we should skip exit offers.
@@ -113,24 +138,20 @@ final class PurchaseHandler: ObservableObject {
     @Published
     fileprivate(set) var restoreError: Error?
 
-    private var eventData: PaywallEvent.Data?
-
-    /// Whether the close event has already been tracked for the current session.
-    /// Used to prevent duplicate close tracking from both dismiss handlers and onDisappear.
-    private var hasTrackedClose: Bool = false
-
     convenience init(purchases: Purchases = .shared,
                      performPurchase: PerformPurchase? = nil,
                      performRestore: PerformRestore? = nil,
                      purchaseResultPublisher: AnyPublisher<PurchaseResultData, Never> = NotificationCenter
                          .default
-                         .purchaseCompletedPublisher()
+                         .purchaseCompletedPublisher(),
+                     eventTracker: PaywallEventTracker = .shared
     ) {
         self.init(isConfigured: true,
                   purchases: purchases,
                   performPurchase: performPurchase,
                   performRestore: performRestore,
-                  purchaseResultPublisher: purchaseResultPublisher
+                  purchaseResultPublisher: purchaseResultPublisher,
+                  eventTracker: eventTracker
         )
     }
 
@@ -141,10 +162,12 @@ final class PurchaseHandler: ObservableObject {
         performRestore: PerformRestore? = nil,
         purchaseResultPublisher: AnyPublisher<PurchaseResultData, Never> = NotificationCenter
             .default
-            .purchaseCompletedPublisher()
+            .purchaseCompletedPublisher(),
+        eventTracker: PaywallEventTracker
     ) {
         self.isConfigured = isConfigured
         self.purchases = purchases
+        self.paywallEventTracker = eventTracker
         self.performPurchase = performPurchase
         self.performRestore = performRestore
 
@@ -183,11 +206,18 @@ final class PurchaseHandler: ObservableObject {
                                       performRestore: PerformRestore?,
                                       customerInfo: CustomerInfo? = nil,
                                       purchasesAreCompletedBy: PurchasesAreCompletedBy = .revenueCat) -> Self {
-        return .init(isConfigured: false,
-                     purchases: NotConfiguredPurchases(customerInfo: customerInfo,
-                                                       purchasesAreCompletedBy: purchasesAreCompletedBy),
-                                                       performPurchase: performPurchase,
-                                                       performRestore: performRestore)
+        let purchases = NotConfiguredPurchases(
+            customerInfo: customerInfo,
+            purchasesAreCompletedBy: purchasesAreCompletedBy
+        )
+
+        return .init(
+            isConfigured: false,
+            purchases: purchases,
+            performPurchase: performPurchase,
+            performRestore: performRestore,
+            eventTracker: .init(purchases: purchases)
+        )
     }
 
     private func setResult(_ result: PurchaseResultData) {
@@ -207,10 +237,13 @@ final class PurchaseHandler: ObservableObject {
     /// We reset both `sessionPurchaseResult` (used for exit offer logic) and `purchaseResult`
     /// (used for `onPurchaseCompleted` preference) to avoid stale values triggering handlers.
     func resetForNewSession() {
+        if let sessionID = self.activePaywallSessionID {
+            self.paywallEventTracker.discardSession(sessionID: sessionID)
+        }
         self.sessionPurchaseResult = nil
+        self.consecutiveCancellationRequestID = nil
         self.purchaseResult = nil
-        self.eventData = nil
-        self.hasTrackedClose = false
+        self.activePaywallSessionID = nil
     }
 
 }
@@ -235,6 +268,313 @@ extension PurchaseHandler {
         self.purchases.invalidateCustomerInfoCache()
     }
 #endif
+
+}
+
+@available(iOS 15.0, macOS 12.0, tvOS 15.0, watchOS 8.0, *)
+extension PurchaseHandler {
+
+#if !os(tvOS)
+    struct ResolvedPaywallViewData {
+        let offering: Offering
+        let workflowContext: WorkflowContext?
+    }
+#endif
+
+    func cachedInitialOffering(for content: PaywallViewConfiguration.Content) -> Offering? {
+#if !os(tvOS)
+        let workflowsEndpointEnabled = ProcessInfo.processInfo.workflowsEndpointEnabled
+#else
+        // The workflows endpoint isn't available on tvOS, so always fall through to the cached switch.
+        let workflowsEndpointEnabled = false
+#endif
+
+        return self.cachedInitialOffering(for: content, workflowsEndpointEnabled: workflowsEndpointEnabled)
+    }
+
+    // Exposes the workflow flag so tests can cover both states deterministically without relying on the
+    // `-EnableWorkflowsEndpoint` launch argument being present in the scheme.
+    func cachedInitialOffering(
+        for content: PaywallViewConfiguration.Content,
+        workflowsEndpointEnabled: Bool
+    ) -> Offering? {
+        // The passed/cached offering alone can't drive a workflow paywall: under workflows the
+        // rendered offering is the workflow screen's offering with its workflow-mapped components,
+        // and it needs a WorkflowContext the offering doesn't carry. Workflow seeding therefore goes
+        // through cachedInitialWorkflowContext(for:workflowsEndpointEnabled:) (which can build the
+        // context from a warm cache); this overload returns nil so callers don't seed a non-workflow
+        // paywall that would then swap once the workflow resolves.
+        if workflowsEndpointEnabled {
+            return nil
+        }
+
+        switch content {
+        case let .offering(offering):
+            return offering
+        case .defaultOffering:
+            return self.purchases.cachedOfferings?.current
+        case let .offeringIdentifier(identifier, presentedOfferingContext):
+            let offering = self.purchases.cachedOfferings?.offering(identifier: identifier)
+
+            if let presentedOfferingContext {
+                return offering?.withPresentedOfferingContext(presentedOfferingContext)
+            }
+
+            return offering
+        }
+    }
+
+    func resolveOffering(for content: PaywallViewConfiguration.Content) async -> Offering? {
+        if case let .offering(offering) = content {
+            return offering
+        }
+
+        do {
+            return try await self.resolveOfferingOrThrow(for: content)
+        } catch {
+            Logger.error(Strings.errorFetchingOfferings(error))
+            return nil
+        }
+    }
+
+    func resolveOfferingOrThrow(for content: PaywallViewConfiguration.Content) async throws -> Offering {
+#if !os(tvOS)
+        return try await self.resolvePaywallViewData(for: content).offering
+#else
+        switch content {
+        case let .offering(offering):
+            return offering
+        case .defaultOffering:
+            return try await self.purchases.offerings().current.orThrow(PaywallError.noCurrentOffering)
+        case let .offeringIdentifier(identifier, presentedOfferingContext):
+            return try await self.resolveOfferingIdentifier(
+                identifier: identifier,
+                presentedOfferingContext: presentedOfferingContext
+            )
+        }
+#endif
+    }
+
+    private func resolveOfferingIdentifier(
+        identifier: String,
+        presentedOfferingContext: PresentedOfferingContext?
+    ) async throws -> Offering {
+        let offering = try await self.purchases.offerings()
+            .offering(identifier: identifier)
+            .orThrow(PaywallError.offeringNotFound(identifier: identifier))
+
+        if let presentedOfferingContext {
+            return offering.withPresentedOfferingContext(presentedOfferingContext)
+        }
+
+        return offering
+    }
+
+#if !os(tvOS)
+    /// Synchronously builds the workflow ``WorkflowContext`` for `content` from already-cached
+    /// workflow + offerings data, so a warm cache can seed the paywall without a loading state.
+    /// Returns `nil` when workflows are disabled, when the cache is cold/stale, or on any partial
+    /// hit (workflow cached but its base offering absent), in which case the async resolve path runs.
+    func cachedInitialWorkflowContext(
+        for content: PaywallViewConfiguration.Content,
+        workflowsEndpointEnabled: Bool
+    ) -> WorkflowContext? {
+        guard workflowsEndpointEnabled else { return nil }
+
+        // Snapshot the cached offerings once so the default-offering lookup and the workflow's base
+        // offering are resolved against the same value; `cachedOfferings` can be replaced on a
+        // background thread, and reading it twice could mix two different snapshots. A nil snapshot
+        // means the async resolve path runs instead of seeding a partial paywall.
+        guard let allOfferings = self.purchases.cachedOfferings else { return nil }
+
+        // Resolve the lookup identifier and presented-offering context the same way the async
+        // resolvePaywallViewData(for:) dispatch does for each content type.
+        let identifier: String
+        let presentedOfferingContext: PresentedOfferingContext?
+        switch content {
+        case let .offering(offering):
+            identifier = offering.identifier
+            presentedOfferingContext = offering.presentedOfferingContext
+        case .defaultOffering:
+            guard let current = allOfferings.current else { return nil }
+            identifier = current.identifier
+            presentedOfferingContext = current.presentedOfferingContext
+        case let .offeringIdentifier(offeringIdentifier, context):
+            identifier = offeringIdentifier
+            presentedOfferingContext = context
+        }
+
+        // A fresh cached workflow must be present; a miss returns nil so the async resolve path runs
+        // instead of seeding a partial paywall.
+        guard let workflowResult = self.purchases.cachedWorkflow(forOfferingIdentifier: identifier) else {
+            return nil
+        }
+
+        // A throw here (no initial screen, or the screen's offering missing from the cached
+        // offerings) is treated as a cache miss: return nil so the async resolve path runs.
+        return try? Self.makeWorkflowContext(
+            workflow: workflowResult.workflow,
+            allOfferings: allOfferings,
+            presentedOfferingContext: presentedOfferingContext,
+            triggerOfferingIdentifier: identifier
+        )
+    }
+
+    func resolvePaywallViewData(
+        for content: PaywallViewConfiguration.Content
+    ) async throws -> ResolvedPaywallViewData {
+        return try await self.resolvePaywallViewData(
+            for: content,
+            workflowsEndpointEnabled: ProcessInfo.processInfo.workflowsEndpointEnabled
+        )
+    }
+
+    func resolvePaywallViewData(
+        for content: PaywallViewConfiguration.Content,
+        workflowsEndpointEnabled: Bool
+    ) async throws -> ResolvedPaywallViewData {
+        switch content {
+        case let .offering(offering):
+            if workflowsEndpointEnabled {
+                return try await self.resolveWorkflowPaywallViewData(for: offering)
+            }
+
+            return .init(offering: offering, workflowContext: nil)
+        case .defaultOffering:
+            let offerings = try await self.purchases.offerings()
+            let offering = try offerings.current.orThrow(PaywallError.noCurrentOffering)
+
+            if workflowsEndpointEnabled {
+                return try await self.resolveWorkflowPaywallViewData(for: offering, offerings: offerings)
+            }
+
+            return .init(offering: offering, workflowContext: nil)
+        case let .offeringIdentifier(identifier, presentedOfferingContext):
+            return try await self.resolveOfferingIdentifier(
+                identifier: identifier,
+                presentedOfferingContext: presentedOfferingContext,
+                workflowsEndpointEnabled: workflowsEndpointEnabled
+            )
+        }
+    }
+#endif
+
+#if !os(tvOS)
+    private func resolveWorkflowPaywallViewData(
+        for offering: Offering,
+        offerings: Offerings? = nil
+    ) async throws -> ResolvedPaywallViewData {
+        let context = try await self.resolveWorkflowContext(
+            identifier: offering.identifier,
+            presentedOfferingContext: offering.presentedOfferingContext,
+            offerings: offerings
+        )
+
+        return .init(offering: context.initialOffering, workflowContext: context)
+    }
+
+    private func resolveOfferingIdentifier(
+        identifier: String,
+        presentedOfferingContext: PresentedOfferingContext?,
+        workflowsEndpointEnabled: Bool
+    ) async throws -> ResolvedPaywallViewData {
+        if workflowsEndpointEnabled {
+            let context = try await self.resolveWorkflowContext(
+                identifier: identifier,
+                presentedOfferingContext: presentedOfferingContext
+            )
+            return .init(offering: context.initialOffering, workflowContext: context)
+        }
+
+        let offering = try await self.purchases.offerings()
+            .offering(identifier: identifier)
+            .orThrow(PaywallError.offeringNotFound(identifier: identifier))
+
+        let resolvedOffering: Offering
+        if let presentedOfferingContext {
+            resolvedOffering = offering.withPresentedOfferingContext(presentedOfferingContext)
+        } else {
+            resolvedOffering = offering
+        }
+
+        return .init(offering: resolvedOffering, workflowContext: nil)
+    }
+
+    // Callers gate on workflowsEndpointEnabled before reaching this point, so this assumes
+    // workflows are enabled and always resolves against the workflow endpoint.
+    func resolveWorkflowContext(
+        identifier: String,
+        presentedOfferingContext: PresentedOfferingContext?,
+        offerings: Offerings? = nil
+    ) async throws -> WorkflowContext {
+        async let fetchResultTask = self.purchases.workflow(forOfferingIdentifier: identifier)
+
+        // Reuse the caller's offerings snapshot when provided (e.g. the .defaultOffering path
+        // already fetched it) to avoid a redundant offerings() call. Otherwise fetch it
+        // concurrently with the workflow request.
+        let allOfferings: Offerings
+        if let offerings {
+            allOfferings = offerings
+        } else {
+            allOfferings = try await self.purchases.offerings()
+        }
+
+        let fetchResult = try await fetchResultTask
+
+        return try Self.makeWorkflowContext(
+            workflow: fetchResult.workflow,
+            allOfferings: allOfferings,
+            presentedOfferingContext: presentedOfferingContext,
+            triggerOfferingIdentifier: identifier
+        )
+    }
+
+    /// Builds a ``WorkflowContext`` from already-resolved `workflow` + `allOfferings`. The context's
+    /// `initialOffering` carries the workflow screen's offering with its mapped paywall components
+    /// applied, so callers can read `context.initialOffering` instead of receiving it separately.
+    /// Shared by the async resolve path and the synchronous cache seed: the async path lets the thrown
+    /// error propagate, while the seed treats any throw as a miss (via `try?`) and falls through.
+    /// Throws ``PaywallError/offeringNotFound(identifier:)`` when the workflow has no initial screen
+    /// (reporting `triggerOfferingIdentifier`) or when that screen's offering is absent from
+    /// `allOfferings` (reporting the screen's own offering identifier that was actually missing).
+    static func makeWorkflowContext(
+        workflow: PublishedWorkflow,
+        allOfferings: Offerings,
+        presentedOfferingContext: PresentedOfferingContext?,
+        triggerOfferingIdentifier: String
+    ) throws -> WorkflowContext {
+        guard let step = workflow.steps[workflow.initialStepId],
+              let screenID = step.screenId,
+              let screen = workflow.screens[screenID] else {
+            throw PaywallError.offeringNotFound(identifier: triggerOfferingIdentifier)
+        }
+
+        guard let baseOffering = allOfferings.offering(identifier: screen.offeringIdentifier) else {
+            throw PaywallError.offeringNotFound(identifier: screen.offeringIdentifier ?? triggerOfferingIdentifier)
+        }
+
+        let paywallComponents = WorkflowScreenMapper.toPaywallComponents(
+            screen: screen,
+            uiConfig: workflow.uiConfig
+        )
+
+        let initialOffering = baseOffering.withPaywallComponents(paywallComponents)
+
+        let offering: Offering
+        if let presentedOfferingContext {
+            offering = initialOffering.withPresentedOfferingContext(presentedOfferingContext)
+        } else {
+            offering = initialOffering
+        }
+
+        return WorkflowContext(
+            workflow: workflow,
+            allOfferings: allOfferings,
+            initialOffering: offering,
+            presentedOfferingContext: presentedOfferingContext
+        )
+    }
+    #endif
 
 }
 
@@ -271,29 +611,32 @@ extension PurchaseHandler {
         }
 
         self.startAction(.purchase)
+        let paywallEvent = self.createPurchaseInitiatedEvent(package: package)
+        if let paywallEvent { self.track(paywallEvent) }
 
         do {
             let result: PurchaseResultData
 
-            if let promotionalOffer {
-                result = try await self.purchases.purchase(package: package, promotionalOffer: promotionalOffer)
-            } else {
-                result = try await self.purchases.purchase(package: package)
-            }
+            result = try await self.purchases.purchase(package: package,
+                                                       promotionalOffer: promotionalOffer,
+                                                       paywallEvent: paywallEvent)
 
             if result.userCancelled {
-                self.trackCancelledPurchase()
-            } else {
-                // Set sessionPurchaseResult BEFORE setResult so that handleMainPaywallDismiss
-                // sees the correct state when the sheet dismisses
-                withAnimation(Constants.defaultAnimation) {
-                    self.sessionPurchaseResult = result
-                }
+                self.trackCancelledPurchase(package: package)
+            }
+
+            // Set sessionPurchaseResult BEFORE setResult so that handleMainPaywallDismiss
+            // sees the correct state when the sheet dismisses.
+            // This is set for both successful and cancelled results so that
+            // onPurchaseCompleted and onPurchaseCancelled modifiers both work correctly.
+            withAnimation(Constants.defaultAnimation) {
+                self.sessionPurchaseResult = result
             }
 
             self.setResult(result)
 
         } catch {
+            self.trackPurchaseError(package: package, error: error)
             self.purchaseError = error
             throw error
         }
@@ -318,14 +661,25 @@ extension PurchaseHandler {
         }
 
         self.startAction(.purchase)
+        let paywallEvent = self.createPurchaseInitiatedEvent(package: package)
+        if let paywallEvent { self.track(paywallEvent) }
+        let productIdentifier = package.storeProduct.productIdentifier
+        self.purchases.cachePurchaseData(
+            presentedOfferingContext: package.presentedOfferingContext,
+            paywallEvent: paywallEvent,
+            productIdentifier: productIdentifier
+        )
 
         let result = await externalPurchaseMethod(package)
 
         if result.userCancelled {
-            self.trackCancelledPurchase()
+            self.trackCancelledPurchase(package: package)
+            self.purchases.clearCachedPurchaseData(productIdentifier: productIdentifier)
         }
 
         if let error = result.error {
+            self.trackPurchaseError(package: package, error: error)
+            self.purchases.clearCachedPurchaseData(productIdentifier: productIdentifier)
             self.purchaseError = error
             throw error
         }
@@ -334,12 +688,12 @@ extension PurchaseHandler {
                                              customerInfo: try await self.purchases.customerInfo(),
                                             userCancelled: result.userCancelled)
 
-        if !result.userCancelled && result.error == nil {
-            // Set sessionPurchaseResult BEFORE setResult so that handleMainPaywallDismiss
-            // sees the correct state when the sheet dismisses
-            withAnimation(Constants.defaultAnimation) {
-                self.sessionPurchaseResult = resultInfo
-            }
+        // Set sessionPurchaseResult BEFORE setResult so that handleMainPaywallDismiss
+        // sees the correct state when the sheet dismisses.
+        // This is set for both successful and cancelled results so that
+        // onPurchaseCompleted and onPurchaseCancelled modifiers both work correctly.
+        withAnimation(Constants.defaultAnimation) {
+            self.sessionPurchaseResult = resultInfo
         }
 
         self.setResult(resultInfo)
@@ -426,58 +780,80 @@ extension PurchaseHandler {
     }
 
     func trackPaywallImpression(_ eventData: PaywallEvent.Data) {
-        self.eventData = eventData
-        self.hasTrackedClose = false
-        self.track(.impression(.init(), eventData))
+        self.activePaywallSessionID = eventData.sessionIdentifier
+        self.paywallEventTracker.trackPaywallImpression(eventData)
+    }
+
+    func componentInteractionLogger(sessionID: PaywallEvent.SessionID) -> ComponentInteractionLogger {
+        return self.paywallEventTracker.componentInteractionLogger(sessionID: sessionID)
     }
 
     /// - Returns: whether the event was tracked
     @discardableResult
     func trackPaywallClose() -> Bool {
-        guard let data = self.eventData, !self.hasTrackedClose else {
-            if self.eventData == nil {
-                Logger.debug("Attempted to track paywall close but eventData is nil")
-            } else if self.hasTrackedClose {
-                Logger.debug("Attempted to track paywall close but close was already tracked")
-            }
+        guard let sessionID = self.activePaywallSessionID else {
             return false
         }
+        // Keep `activePaywallSessionID` set after close so `trackExitOffer` can still resolve paywall data.
+        return self.paywallEventTracker.trackPaywallClose(sessionID: sessionID)
+    }
 
-        self.track(.close(.init(), data))
-        self.hasTrackedClose = true
-        return true
+    /// Tracks a paywall close for a specific session, regardless of which session is currently active.
+    /// A workflow keeps several paywall pages alive at once, so each page must close its own session
+    /// rather than whichever one happened to be impressed last (which `trackPaywallClose()` uses).
+    /// `activePaywallSessionID` is intentionally left untouched so exit-offer resolution still works.
+    /// - Returns: whether the event was tracked
+    @discardableResult
+    func trackPaywallClose(sessionID: PaywallEvent.SessionID) -> Bool {
+        return self.paywallEventTracker.trackPaywallClose(sessionID: sessionID)
     }
 
     /// - Returns: whether the event was tracked
     @discardableResult
-    fileprivate func trackCancelledPurchase() -> Bool {
-        guard let data = self.eventData else {
-            Logger.warning(Strings.attempted_to_track_event_with_missing_data)
+    fileprivate func trackCancelledPurchase(package: Package) -> Bool {
+        guard let sessionID = self.activePaywallSessionID else {
             return false
         }
-
-        self.track(.cancel(.init(), data))
-        return true
+        return self.paywallEventTracker.trackCancelledPurchase(package: package, sessionID: sessionID)
     }
 
-    /// Tracks an exit offer event and clears the pending exit offer flag.
+    /// Creates a purchase-initiated paywall event for the given package.
+    /// - Returns: the event, or `nil` if event data is unavailable.
+    func createPurchaseInitiatedEvent(package: Package) -> PaywallEvent? {
+        guard let sessionID = self.activePaywallSessionID else {
+            return nil
+        }
+        return self.paywallEventTracker.createPurchaseInitiatedEvent(package: package, sessionID: sessionID)
+    }
+
+    /// Tracks a purchase error event.
+    /// - Parameters:
+    ///   - package: The package that was being purchased
+    ///   - error: The error that occurred
+    /// - Returns: whether the event was tracked
+    @discardableResult
+    func trackPurchaseError(package: Package, error: Error) -> Bool {
+        guard let sessionID = self.activePaywallSessionID else {
+            return false
+        }
+        return self.paywallEventTracker.trackPurchaseError(package: package, error: error, sessionID: sessionID)
+    }
+
+    /// Tracks an exit offer event.
     /// - Parameters:
     ///   - exitOfferType: The type of exit offer
     ///   - exitOfferingIdentifier: The offering identifier of the exit offer
     /// - Returns: whether the event was tracked
     @discardableResult
     func trackExitOffer(exitOfferType: ExitOfferType, exitOfferingIdentifier: String) -> Bool {
-        guard let data = self.eventData else {
-            Logger.warning(Strings.attempted_to_track_event_with_missing_data)
+        guard let sessionID = self.activePaywallSessionID else {
             return false
         }
-
-        let exitOfferData = PaywallEvent.ExitOfferData(
+        return self.paywallEventTracker.trackExitOffer(
             exitOfferType: exitOfferType,
-            exitOfferingIdentifier: exitOfferingIdentifier
+            exitOfferingIdentifier: exitOfferingIdentifier,
+            sessionID: sessionID
         )
-        self.track(.exitOffer(.init(), data, exitOfferData))
-        return true
     }
 
     private func startAction(_ type: PurchaseHandler.ActionType) {
@@ -507,18 +883,22 @@ extension PurchaseHandler {
         purchase: @escaping (@escaping MockPurchases.PurchaseBlock) -> MockPurchases.PurchaseBlock,
         restore: @escaping (@escaping MockPurchases.RestoreBlock) -> MockPurchases.RestoreBlock
     ) -> Self {
+        let purchases = self.purchases.map(purchase: purchase, restore: restore)
         return .init(
             isConfigured: self.isConfigured,
-            purchases: self.purchases.map(purchase: purchase, restore: restore)
+            purchases: purchases,
+            eventTracker: self.paywallEventTracker.withPurchases(purchases)
         )
     }
 
     func map(
         trackEvent: @escaping (@escaping MockPurchases.TrackEventBlock) -> MockPurchases.TrackEventBlock
     ) -> Self {
+        let purchases = self.purchases.map(trackEvent: trackEvent)
         return .init(
             isConfigured: self.isConfigured,
-            purchases: self.purchases.map(trackEvent: trackEvent)
+            purchases: purchases,
+            eventTracker: self.paywallEventTracker.withPurchases(purchases)
         )
     }
 
@@ -532,9 +912,7 @@ extension PurchaseHandler {
 private extension PurchaseHandler {
 
     func track(_ event: PaywallEvent) {
-        Task.detached(priority: .background) { [purchases = self.purchases] in
-            await purchases.track(paywallEvent: event)
-        }
+        self.paywallEventTracker.track(event)
     }
 
 }
@@ -559,16 +937,30 @@ private final class NotConfiguredPurchases: PaywallPurchasesType {
         self.purchasesAreCompletedBy = purchasesAreCompletedBy
     }
 
+    func offerings() async throws -> Offerings { throw ErrorCode.configurationError }
+
+    var cachedOfferings: Offerings? { nil }
+
+#if !os(tvOS)
+    func workflow(forOfferingIdentifier offeringID: String) async throws -> WorkflowDataResult {
+        throw ErrorCode.configurationError
+    }
+
+    func cachedWorkflow(forOfferingIdentifier offeringID: String) -> WorkflowDataResult? {
+        return nil
+    }
+#endif
+
     func customerInfo() async throws -> RevenueCat.CustomerInfo {
         guard let info = customerInfo else { throw ErrorCode.configurationError }
         return info
     }
 
-    func purchase(package: Package) async throws -> PurchaseResultData {
-        throw ErrorCode.configurationError
-    }
-
-    func purchase(package: Package, promotionalOffer: PromotionalOffer) async throws -> PurchaseResultData {
+    func purchase(
+        package: Package,
+        promotionalOffer: PromotionalOffer?,
+        paywallEvent: PaywallEvent?
+    ) async throws -> PurchaseResultData {
         throw ErrorCode.configurationError
     }
 
@@ -577,6 +969,12 @@ private final class NotConfiguredPurchases: PaywallPurchasesType {
     }
 
     func track(paywallEvent: PaywallEvent) async {}
+
+    func cachePurchaseData(presentedOfferingContext: PresentedOfferingContext,
+                           paywallEvent: PaywallEvent?,
+                           productIdentifier: String) {}
+
+    func clearCachedPurchaseData(productIdentifier: String) {}
 
 #if !ENABLE_CUSTOM_ENTITLEMENT_COMPUTATION
     func invalidateCustomerInfoCache() {}
@@ -618,25 +1016,48 @@ struct RestoreInProgressPreferenceKey: PreferenceKey {
 struct PurchasedResultPreferenceKey: PreferenceKey {
 
     struct PurchaseResult: Equatable {
+        private var diffKey: String?
         var transaction: StoreTransaction?
         var customerInfo: CustomerInfo
         var userCancelled: Bool
 
-        init(data: PurchaseResultData) {
+        init(data: PurchaseResultData, diffKey: UUID? = nil) {
+            self.diffKey = diffKey?.uuidString ?? data.transaction?.id
             self.transaction = data.transaction
             self.customerInfo = data.customerInfo
             self.userCancelled = data.userCancelled
         }
 
-        init?(data: PurchaseResultData?) {
+        init?(data: PurchaseResultData?, diffKey: UUID? = nil) {
             guard let data else { return nil }
-            self.init(data: data)
+            self.init(data: data, diffKey: diffKey)
         }
     }
 
     static var defaultValue: PurchaseResult?
 
     static func reduce(value: inout PurchaseResult?, nextValue: () -> PurchaseResult?) {
+        value = nextValue()
+    }
+
+}
+
+struct WorkflowExitOfferContext: Equatable {
+
+    let exitOfferOffering: Offering
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.exitOfferOffering.identifier == rhs.exitOfferOffering.identifier
+    }
+
+}
+
+@available(iOS 15.0, macOS 12.0, tvOS 15.0, watchOS 8.0, *)
+struct WorkflowExitOfferPreferenceKey: PreferenceKey {
+
+    static var defaultValue: WorkflowExitOfferContext?
+
+    static func reduce(value: inout WorkflowExitOfferContext?, nextValue: () -> WorkflowExitOfferContext?) {
         value = nextValue()
     }
 
@@ -701,6 +1122,20 @@ extension EnvironmentValues {
     var purchaseInitiatedAction: PurchaseInitiatedAction? {
         get { self[PurchaseInitiatedActionKey.self] }
         set { self[PurchaseInitiatedActionKey.self] = newValue }
+    }
+}
+
+/// `EnvironmentKey` for storing the restore initiated interceptor action.
+@available(iOS 15.0, macOS 12.0, tvOS 15.0, watchOS 8.0, *)
+struct RestoreInitiatedActionKey: EnvironmentKey {
+    static let defaultValue: RestoreInitiatedAction? = nil
+}
+
+@available(iOS 15.0, macOS 12.0, tvOS 15.0, watchOS 8.0, *)
+extension EnvironmentValues {
+    var restoreInitiatedAction: RestoreInitiatedAction? {
+        get { self[RestoreInitiatedActionKey.self] }
+        set { self[RestoreInitiatedActionKey.self] = newValue }
     }
 }
 
